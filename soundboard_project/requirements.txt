@@ -1,0 +1,7 @@
+numpy
+scipy
+sounddevice
+soundfile
+pynput
+Pillow
+# Optional: tkinterdnd2 (drag-and-drop support; LOAD WAV works without it)

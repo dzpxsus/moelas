@@ -1,72 +1,83 @@
 
-
 """
-JESUS 2026 Soundboard
-WAV sample synthesizer with octave controls and live audio effects.
+JESUS 2026 SOUNDBOARD 3.0
+WAV soundboard + polyphonic synthesizer + WAV sampler + performance looper.
 
-Python 3.10+ recommended.
+Requirements:
+    python -m pip install --user numpy scipy sounddevice soundfile pynput Pillow tkinterdnd2
 
-Hotkeys:
-    ALT+1 ... ALT+9 = sounds 1-9
-    ALT+0            = sound 10
+Folder structure:
+    soundboard.py
+    music/
+        tarzan.wav
+        bipbip.wav
+        badumtss.wav
+        r2D2.wav
+        scout.wav
+        batman.wav
+        sound7.wav
+        sound8.wav
+        sound9.wav
+        sound10.wav
+    pics/
+        background.jpg     (optional)
+
+Shortcuts:
+    ALT+1 ... ALT+9 = play WAV files
+    ALT+0            = play WAV file 10
     A W S E D F T G Y H U J K O L = synthesizer notes
     [ / ]            = lower / raise octave
+    SPACE            = stop WAV playback\n    REC / PLAY LOOP    = record and loop keyboard performances
 """
-
-from __future__ import annotations
 
 import math
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
-from math import gcd
+from tkinter import filedialog, messagebox
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_AVAILABLE = True
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
+    DND_AVAILABLE = False
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from pynput import keyboard
 from PIL import Image, ImageTk
-from scipy.signal import resample_poly
+from scipy.signal import lfilter, resample_poly
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-APP_TITLE = "JESUS 2026 Soundboard"
+APP_TITLE = "JESUS 2026 Soundboard 2.0"
+
 MUSIC_DIR = "music"
 PICS_DIR = "pics"
 BACKGROUND_FILE = os.path.join(PICS_DIR, "background.jpg")
 
-TARGET_DEVICE_INDEX = 17
-TARGET_SAMPLE_RATE = 48000
-TARGET_CHANNELS = 2
-PLAYBACK_VOLUME = 0.05
+PREFERRED_DEVICE = 17
+SAMPLE_RATE = 48000
+CHANNELS = 2
+BLOCK_SIZE = 2048
 
-WINDOW_WIDTH = 520
-WINDOW_HEIGHT = 850
+# Independent volume controls
+WAV_VOLUME = 0.65
+SYNTH_VOLUME = 0.20
+MASTER_VOLUME = 0.75
 
-PRESETS = {
-    "No live effects": {
-        "pitch": 1.00, "echo": 0.00, "reverb": 0.00, "chorus": 0.00
-    },
-    "Cartoon": {
-        "pitch": 1.25, "echo": 0.18, "reverb": 0.22, "chorus": 0.30
-    },
-    "Cinematic": {
-        "pitch": 1.00, "echo": 0.38, "reverb": 0.70, "chorus": 0.08
-    },
-    "Studio": {
-        "pitch": 1.00, "echo": 0.05, "reverb": 0.12, "chorus": 0.05
-    },
-    "Space": {
-        "pitch": 0.85, "echo": 0.45, "reverb": 0.80, "chorus": 0.45
-    },
-}
+MAX_VOICES = 8
 
-TRACK_FILES = {
+TRACKS = {
     "1": ("Tarzan", "tarzan.wav"),
     "2": ("Bip Bip", "bipbip.wav"),
     "3": ("Badum Tss", "badumtss.wav"),
@@ -79,969 +90,1563 @@ TRACK_FILES = {
     "0": ("Sound 10", "sound10.wav"),
 }
 
-
-# ---------------------------------------------------------------------------
-# Audio engine
-# ---------------------------------------------------------------------------
-
-class LiveAudioEngine:
-    """One persistent output stream with sample-based synthesis."""
-
-    def __init__(self, device_index: int):
-        self.device_index = device_index
-        self.sample_rate = TARGET_SAMPLE_RATE
-        self.channels = TARGET_CHANNELS
-        self.lock = threading.RLock()
-
-        self.track = None
-        self.position = 0.0
-        self.track_elapsed_frames = 0
-        self.params = dict(PRESETS["No live effects"])
-        self.volume = PLAYBACK_VOLUME
-        self.active = False
-
-        # The last selected WAV remains available to the synthesizer.
-        # MIDI note -> current sample position.
-        self.synth_sample = None
-        self.synth_notes = {}
-
-        self.stream = None
-
-        # Effect delay lines, each containing stereo frames.
-        self.echo_buffer = np.zeros(
-            (int(self.sample_rate * 1.2), 2), dtype=np.float32
-        )
-        self.reverb_a = np.zeros(
-            (int(self.sample_rate * 0.071), 2), dtype=np.float32
-        )
-        self.reverb_b = np.zeros(
-            (int(self.sample_rate * 0.113), 2), dtype=np.float32
-        )
-        self.chorus_buffer = np.zeros(
-            (int(self.sample_rate * 0.04), 2), dtype=np.float32
-        )
-
-        self.echo_pos = 0
-        self.reverb_a_pos = 0
-        self.reverb_b_pos = 0
-        self.chorus_pos = 0
-        self.lfo_phase = 0.0
-        self.echo_delay_frames = int(self.sample_rate * 0.28)
-
-        self._open_stream()
-
-    def _open_stream(self):
-        self.stream = sd.OutputStream(
-            device=self.device_index,
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype="float32",
-            blocksize=2048,
-            latency="high",
-            callback=self._callback,
-        )
-        self.stream.start()
-
-    def set_params(self, **kwargs):
-        with self.lock:
-            for name, value in kwargs.items():
-                if name in ("pitch", "echo", "reverb", "chorus"):
-                    self.params[name] = float(value)
-
-    def apply_preset(self, name):
-        preset = PRESETS.get(name, PRESETS["No live effects"])
-        self.set_params(**preset)
-
-    def play(self, audio):
-        with self.lock:
-            self.track = audio
-            self.position = 0.0
-            self.track_elapsed_frames = 0
-            self.active = True
-
-            # The last WAV played becomes the synth's sample.
-            self.synth_sample = audio
-            self.synth_notes.clear()
-            self._clear_effect_buffers()
-
-    def stop(self):
-        with self.lock:
-            self.active = False
-            self.track = None
-            self.position = 0.0
-
-            # Keep synth_sample loaded after STOP.
-            self._clear_effect_buffers()
-
-    def note_on(self, midi_note):
-        """Play the last WAV at the selected MIDI pitch."""
-        with self.lock:
-            if (
-                self.synth_sample is not None
-                and midi_note not in self.synth_notes
-            ):
-                self.synth_notes[int(midi_note)] = 0.0
-
-    def note_off(self, midi_note):
-        with self.lock:
-            self.synth_notes.pop(int(midi_note), None)
-
-    def _clear_effect_buffers(self):
-        self.echo_buffer.fill(0)
-        self.reverb_a.fill(0)
-        self.reverb_b.fill(0)
-        self.chorus_buffer.fill(0)
-
-        self.echo_pos = 0
-        self.reverb_a_pos = 0
-        self.reverb_b_pos = 0
-        self.chorus_pos = 0
-        self.lfo_phase = 0.0
-
-    def _callback(self, outdata, frames, time_info, status):
-        """
-        PortAudio callback.
-
-        Keep this function as efficient as possible. Audio callbacks must
-        complete before the output buffer deadline to avoid underruns.
-        """
-        outdata.fill(0)
-
-        with self.lock:
-            synth = np.zeros((frames, 2), dtype=np.float32)
-
-            # ---------------------------------------------------------------
-            # Sample-based synthesizer
-            # ---------------------------------------------------------------
-            if self.synth_sample is not None and self.synth_notes:
-                sample = self.synth_sample
-                sample_length = len(sample)
-                finished_notes = []
-
-                for midi_note, position in list(self.synth_notes.items()):
-                    # MIDI 60 is C4, the original sample pitch.
-                    # Every semitone changes playback rate.
-                    rate = 2.0 ** ((midi_note - 60) / 12.0)
-
-                    positions = position + rate * np.arange(
-                        frames, dtype=np.float64
-                    )
-                    valid = positions < sample_length
-
-                    if not np.any(valid):
-                        finished_notes.append(midi_note)
-                        continue
-
-                    indices = positions[valid]
-                    idx0 = indices.astype(np.int64)
-                    idx1 = np.minimum(idx0 + 1, sample_length - 1)
-                    frac = (indices - idx0).astype(np.float32)[:, None]
-
-                    rendered = (
-                        sample[idx0] * (1.0 - frac)
-                        + sample[idx1] * frac
-                    )
-
-                    # 10 ms attack fade to reduce initial clicks.
-                    valid_frames = np.flatnonzero(valid)
-                    elapsed_frames = position / rate + valid_frames
-                    attack_frames = max(1.0, self.sample_rate * 0.010)
-                    envelope = np.minimum(
-                        elapsed_frames / attack_frames, 1.0
-                    )
-                    rendered *= envelope.astype(np.float32)[:, None]
-
-                    synth[valid] += rendered
-
-                    next_position = position + rate * frames
-
-                    if next_position >= sample_length:
-                        finished_notes.append(midi_note)
-                    else:
-                        self.synth_notes[midi_note] = next_position
-
-                for midi_note in finished_notes:
-                    self.synth_notes.pop(midi_note, None)
-
-                note_count = max(1, len(self.synth_notes))
-                synth /= max(1.0, note_count ** 0.65)
-
-            # If no WAV is playing, synthesizer notes can still play.
-            if not self.active or self.track is None:
-                outdata[:] = np.tanh(synth * self.volume * 1.4)
-                return
-
-            # ---------------------------------------------------------------
-            # Normal WAV playback
-            # ---------------------------------------------------------------
-            audio = self.track
-            total_frames = len(audio)
-
-            if total_frames == 0:
-                self.active = False
-                self.track = None
-                outdata[:] = np.tanh(synth * self.volume * 1.4)
-                return
-
-            pitch = float(np.clip(self.params["pitch"], 0.5, 2.0))
-            echo_mix = float(np.clip(self.params["echo"], 0.0, 0.8))
-            reverb_mix = float(np.clip(self.params["reverb"], 0.0, 0.85))
-            chorus_mix = float(np.clip(self.params["chorus"], 0.0, 0.8))
-
-            effects_bypassed = (
-                abs(pitch - 1.0) < 1e-6
-                and echo_mix == 0.0
-                and reverb_mix == 0.0
-                and chorus_mix == 0.0
-            )
-
-            for i in range(frames):
-                pos = self.position
-
-                if pos >= total_frames:
-                    self.active = False
-                    self.track = None
-                    break
-
-                idx = int(pos)
-                frac = pos - idx
-                next_idx = min(idx + 1, total_frames - 1)
-
-                dry = (
-                    audio[idx] * (1.0 - frac)
-                    + audio[next_idx] * frac
-                )
-
-                # 10 ms fade-in for WAV playback.
-                attack_frames = max(1.0, self.sample_rate * 0.010)
-                attack_gain = min(
-                    self.track_elapsed_frames / attack_frames, 1.0
-                )
-                dry = dry * attack_gain
-                self.track_elapsed_frames += 1
-                self.position += pitch
-
-                # Echo with feedback.
-                echo_read_pos = (
-                    self.echo_pos - self.echo_delay_frames
-                ) % len(self.echo_buffer)
-                echo_delayed = self.echo_buffer[echo_read_pos].copy()
-
-                self.echo_buffer[self.echo_pos] = (
-                    dry + echo_delayed * 0.28
-                )
-                self.echo_pos = (
-                    self.echo_pos + 1
-                ) % len(self.echo_buffer)
-
-                # Two short feedback delay lines approximate reverb.
-                ra = self.reverb_a[self.reverb_a_pos].copy()
-                rb = self.reverb_b[self.reverb_b_pos].copy()
-
-                self.reverb_a[self.reverb_a_pos] = dry + rb * 0.52
-                self.reverb_b[self.reverb_b_pos] = dry + ra * 0.47
-
-                self.reverb_a_pos = (
-                    self.reverb_a_pos + 1
-                ) % len(self.reverb_a)
-                self.reverb_b_pos = (
-                    self.reverb_b_pos + 1
-                ) % len(self.reverb_b)
-
-                reverbed = (ra + rb) * 0.5
-
-                # Chorus with a modulated short delay.
-                lfo = (math.sin(self.lfo_phase) + 1.0) * 0.5
-                chorus_delay = int(
-                    0.008 * self.sample_rate
-                    + lfo * 0.018 * self.sample_rate
-                )
-                chorus_delay = min(
-                    chorus_delay, len(self.chorus_buffer) - 1
-                )
-
-                read_pos = (
-                    self.chorus_pos - chorus_delay
-                ) % len(self.chorus_buffer)
-                chorus_delayed = self.chorus_buffer[read_pos].copy()
-
-                self.chorus_buffer[self.chorus_pos] = dry
-                self.chorus_pos = (
-                    self.chorus_pos + 1
-                ) % len(self.chorus_buffer)
-
-                self.lfo_phase += (
-                    2.0 * math.pi * 0.7 / self.sample_rate
-                )
-                if self.lfo_phase >= 2.0 * math.pi:
-                    self.lfo_phase -= 2.0 * math.pi
-
-                wet = dry
-                wet += echo_mix * echo_delayed
-                wet += reverb_mix * reverbed
-                wet += chorus_mix * (chorus_delayed - dry * 0.5)
-
-                if effects_bypassed:
-                    outdata[i] = (dry + synth[i]) * self.volume
-                else:
-                    outdata[i] = np.tanh(
-                        wet * self.volume * 1.4
-                        + synth[i] * self.volume * 1.4
-                    )
-
-    def close(self):
-        self.stop()
-
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
+# QWERTY chromatic keyboard. A = root note.
+KEY_SEMITONES = {
+    "a": 0, "w": 1,
+    "s": 2, "e": 3,
+    "d": 4, "f": 5,
+    "t": 6, "g": 7,
+    "y": 8, "h": 9,
+    "u": 10, "j": 11,
+    "k": 12, "o": 13, "l": 14,
+}
 
 
-# ---------------------------------------------------------------------------
-# Audio utilities
-# ---------------------------------------------------------------------------
+# ============================================================
+# AUDIO DEVICE
+# ============================================================
 
 def find_output_device():
-    """Prefer the configured Realtek output, then another output device."""
+    """Choose the preferred output if available, otherwise the default."""
     try:
         devices = sd.query_devices()
 
-        if 0 <= TARGET_DEVICE_INDEX < len(devices):
-            device = devices[TARGET_DEVICE_INDEX]
+        if 0 <= PREFERRED_DEVICE < len(devices):
+            candidate = devices[PREFERRED_DEVICE]
+            if candidate["max_output_channels"] >= 2:
+                print(
+                    "[Audio] Preferred output:",
+                    candidate["name"]
+                )
+                return PREFERRED_DEVICE
+
+        default_device = sd.default.device[1]
+        if default_device is not None and int(default_device) >= 0:
+            device = sd.query_devices(int(default_device))
             if device["max_output_channels"] >= 2:
-                return TARGET_DEVICE_INDEX
+                print("[Audio] Default output:", device["name"])
+                return int(default_device)
 
-        for device in devices:
-            if (
-                "realtek" in device["name"].lower()
-                and device["max_output_channels"] >= 2
-            ):
-                return int(device["index"])
+        for index, device in enumerate(devices):
+            if device["max_output_channels"] >= 2:
+                print("[Audio] Using output:", device["name"])
+                return index
 
-        default_output = sd.default.device[1]
-        if default_output is not None and int(default_output) >= 0:
-            return int(default_output)
-
-    except Exception:
-        pass
+    except Exception as exc:
+        print("[Audio] Device discovery error:", exc)
 
     return None
 
 
-def load_audio(path):
-    """Load WAV, convert to stereo float32, and resample to 48 kHz."""
-    data, sample_rate = sf.read(
-        path, dtype="float32", always_2d=True
+def load_wav(path):
+    """Load WAV data and convert it to 48 kHz stereo float audio."""
+    audio, rate = sf.read(
+        path,
+        dtype="float32",
+        always_2d=True
     )
 
-    if data.shape[1] == 1:
-        data = np.repeat(data, 2, axis=1)
-    elif data.shape[1] > 2:
-        data = data[:, :2]
+    if audio.shape[1] == 1:
+        audio = np.repeat(audio, 2, axis=1)
+    elif audio.shape[1] > 2:
+        audio = audio[:, :2]
 
-    if sample_rate != TARGET_SAMPLE_RATE:
-        common = gcd(int(sample_rate), TARGET_SAMPLE_RATE)
-        up = TARGET_SAMPLE_RATE // common
-        down = int(sample_rate) // common
-
-        data = resample_poly(
-            data, up, down, axis=0
+    if rate != SAMPLE_RATE:
+        common = math.gcd(int(rate), SAMPLE_RATE)
+        audio = resample_poly(
+            audio,
+            SAMPLE_RATE // common,
+            int(rate) // common,
+            axis=0
         ).astype(np.float32)
 
-    return np.ascontiguousarray(data, dtype=np.float32)
+    # Remove invalid values that could cause audio glitches.
+    audio = np.nan_to_num(audio, copy=False)
+    return np.ascontiguousarray(audio, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Soundboard GUI
-# ---------------------------------------------------------------------------
+# ============================================================
+# SYNTH VOICE
+# ============================================================
 
-class JesusAlarmSoundboard:
+class SynthVoice:
+    """One oscillator voice with an ADSR envelope."""
+
+    def __init__(self, midi_note, waveform, velocity, phase=0.0):
+        self.note = int(midi_note)
+        self.waveform = waveform
+        self.velocity = float(velocity)
+        self.phase = float(phase)
+
+        self.stage = "attack"
+        self.stage_position = 0
+        self.level = 0.0
+        self.release_start = 0.0
+
+    def release(self):
+        if self.stage != "release":
+            self.release_start = self.level
+            self.stage = "release"
+            self.stage_position = 0
+
+    def render_envelope(self, frames, rate, attack, decay,
+                        sustain, release):
+        """Generate a click-reducing envelope without a per-sample loop."""
+        envelope = np.zeros(frames, dtype=np.float32)
+        offset = 0
+
+        attack_n = max(1, int(attack * rate))
+        decay_n = max(1, int(decay * rate))
+        release_n = max(1, int(release * rate))
+
+        while offset < frames:
+            remaining = frames - offset
+
+            if self.stage == "attack":
+                count = min(
+                    remaining,
+                    attack_n - self.stage_position
+                )
+                positions = (
+                    self.stage_position
+                    + np.arange(count, dtype=np.float32)
+                    + 1.0
+                )
+                envelope[offset:offset + count] = np.minimum(
+                    positions / attack_n, 1.0
+                )
+                self.stage_position += count
+                self.level = min(
+                    self.stage_position / attack_n, 1.0
+                )
+
+                if self.stage_position >= attack_n:
+                    self.stage = "decay"
+                    self.stage_position = 0
+                    self.level = 1.0
+
+            elif self.stage == "decay":
+                count = min(
+                    remaining,
+                    decay_n - self.stage_position
+                )
+                positions = (
+                    self.stage_position
+                    + np.arange(count, dtype=np.float32)
+                    + 1.0
+                )
+                progress = np.minimum(positions / decay_n, 1.0)
+                values = 1.0 + (sustain - 1.0) * progress
+
+                envelope[offset:offset + count] = values
+                self.stage_position += count
+                self.level = float(values[-1])
+
+                if self.stage_position >= decay_n:
+                    self.stage = "sustain"
+                    self.stage_position = 0
+                    self.level = sustain
+
+            elif self.stage == "sustain":
+                count = remaining
+                envelope[offset:offset + count] = sustain
+                self.level = sustain
+
+            elif self.stage == "release":
+                count = min(
+                    remaining,
+                    release_n - self.stage_position
+                )
+                positions = (
+                    self.stage_position
+                    + np.arange(count, dtype=np.float32)
+                    + 1.0
+                )
+                progress = np.minimum(positions / release_n, 1.0)
+                values = self.release_start * (1.0 - progress)
+
+                envelope[offset:offset + count] = values
+                self.stage_position += count
+                self.level = max(float(values[-1]), 0.0)
+
+                if self.stage_position >= release_n:
+                    self.stage = "finished"
+                    self.level = 0.0
+
+            else:
+                break
+
+            offset += count
+
+        return envelope
+
+
+# ============================================================
+# AUDIO ENGINE
+# ============================================================
+
+class AudioEngine:
+    """
+    Single persistent output stream.
+
+    WAV playback and the synthesizer are separate sources and can
+    be mixed together. The callback processes blocks rather than
+    opening a new stream for every note.
+    """
+
+    def __init__(self, device):
+        self.device = device
+        self.lock = threading.RLock()
+
+        self.wav_audio = None
+        self.wav_position = 0.0
+        self.wav_active = False
+        self.wav_fade_in_position = 0
+
+        self.voices = {}
+        self.sample_audio = None
+        self.sample_name = ""
+        self.sample_mode = False
+        self.sample_voices = {}
+        self.waveform = "Saw"
+        self.attack = 0.010
+        self.decay = 0.12
+        self.sustain = 0.70
+        self.release = 0.080
+
+        self.cutoff = 12000.0
+        self.resonance = 0.0
+        self.detune = 0.0
+        self.sub_level = 0.0
+
+        self.synth_volume = SYNTH_VOLUME
+        self.wav_volume = WAV_VOLUME
+        self.master_volume = MASTER_VOLUME
+
+        # Simple stereo delay and reverb buffers.
+        self.delay_mix = 0.0
+        self.reverb_mix = 0.0
+        self.delay_seconds = 0.28
+
+        self.delay_buffer = np.zeros(
+            (int(SAMPLE_RATE * 1.5), 2), dtype=np.float32
+        )
+        self.reverb_buffer = np.zeros(
+            (int(SAMPLE_RATE * 0.13), 2), dtype=np.float32
+        )
+        self.delay_position = 0
+        self.reverb_position = 0
+
+        # One-pole low-pass filter state.
+        self.filter_state = np.zeros((1, 2), dtype=np.float32)
+
+        self.stream = sd.OutputStream(
+            device=device,
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="float32",
+            blocksize=BLOCK_SIZE,
+            latency="high",
+            callback=self.callback
+        )
+        self.stream.start()
+
+        print(
+            f"[Audio] Running at {SAMPLE_RATE} Hz, "
+            f"block size {BLOCK_SIZE}"
+        )
+
+    # --------------------------------------------------------
+    # WAV PLAYER
+    # --------------------------------------------------------
+
+    def play_wav(self, audio):
+        with self.lock:
+            self.wav_audio = audio
+            self.wav_position = 0.0
+            self.wav_fade_in_position = 0
+            self.wav_active = True
+
+    def stop_wav(self):
+        with self.lock:
+            self.wav_active = False
+            self.wav_audio = None
+            self.wav_position = 0.0
+
+    # --------------------------------------------------------
+    # SYNTH CONTROLS
+    # --------------------------------------------------------
+
+    def set_waveform(self, waveform):
+        with self.lock:
+            self.waveform = waveform
+
+    def set_envelope(self, attack=None, decay=None,
+                     sustain=None, release=None):
+        with self.lock:
+            if attack is not None:
+                self.attack = float(attack)
+            if decay is not None:
+                self.decay = float(decay)
+            if sustain is not None:
+                self.sustain = float(sustain)
+            if release is not None:
+                self.release = float(release)
+
+    def set_filter(self, cutoff=None, resonance=None):
+        with self.lock:
+            if cutoff is not None:
+                self.cutoff = float(cutoff)
+            if resonance is not None:
+                self.resonance = float(resonance)
+
+    def set_effects(self, delay=None, reverb=None):
+        with self.lock:
+            if delay is not None:
+                self.delay_mix = float(delay)
+            if reverb is not None:
+                self.reverb_mix = float(reverb)
+
+    def set_detune(self, value):
+        with self.lock:
+            self.detune = float(value)
+
+    def set_sub_level(self, value):
+        with self.lock:
+            self.sub_level = float(value)
+
+    def load_sample(self, audio, name="sample"):
+        with self.lock:
+            self.sample_audio = audio
+            self.sample_name = name
+            self.sample_mode = True
+            self.sample_voices.clear()
+            self.voices.clear()
+
+    def use_synth_mode(self):
+        with self.lock:
+            self.sample_mode = False
+            self.sample_voices.clear()
+
+    def note_on(self, midi_note, velocity=0.8):
+        with self.lock:
+            midi_note = int(midi_note)
+
+            if self.sample_mode and self.sample_audio is not None:
+                self.sample_voices.pop(midi_note, None)
+                if len(self.sample_voices) >= MAX_VOICES:
+                    oldest = next(iter(self.sample_voices))
+                    del self.sample_voices[oldest]
+                self.sample_voices[midi_note] = {
+                    "position": 0.0,
+                    "ratio": 2.0 ** ((midi_note - 60) / 12.0),
+                    "velocity": float(velocity),
+                    "release_remaining": 0,
+                    "release_total": max(1, int(0.04 * SAMPLE_RATE)),
+                    "release_gain": 1.0,
+                }
+                return
+
+            # Retriggering an existing note replaces that voice.
+            if midi_note in self.voices:
+                del self.voices[midi_note]
+
+            # Eight-note polyphony, dropping the oldest voice.
+            if len(self.voices) >= MAX_VOICES:
+                oldest = next(iter(self.voices))
+                del self.voices[oldest]
+
+            self.voices[midi_note] = SynthVoice(
+                midi_note,
+                self.waveform,
+                velocity
+            )
+
+    def note_off(self, midi_note):
+        with self.lock:
+            midi_note = int(midi_note)
+            if self.sample_mode:
+                voice = self.sample_voices.get(midi_note)
+                if voice and voice["release_remaining"] <= 0:
+                    voice["release_remaining"] = voice["release_total"]
+                    voice["release_gain"] = 1.0
+                return
+            voice = self.voices.get(midi_note)
+            if voice:
+                voice.release()
+
+    def release_all(self):
+        with self.lock:
+            for voice in self.voices.values():
+                voice.release()
+            for voice in self.sample_voices.values():
+                if voice["release_remaining"] <= 0:
+                    voice["release_remaining"] = voice["release_total"]
+                    voice["release_gain"] = 1.0
+
+    # --------------------------------------------------------
+    # OSCILLATORS
+    # --------------------------------------------------------
+
+    @staticmethod
+    def oscillator(phase, waveform):
+        if waveform == "Sine":
+            return np.sin(phase)
+
+        if waveform == "Square":
+            return np.where(
+                np.sin(phase) >= 0.0, 1.0, -1.0
+            )
+
+        if waveform == "Triangle":
+            return (2.0 / math.pi) * np.arcsin(np.sin(phase))
+
+        # Sawtooth, using phase wrapped into one cycle.
+        cycle = phase / (2.0 * math.pi)
+        return 2.0 * (cycle - np.floor(cycle + 0.5))
+
+    def render_synth(self, frames):
+        result = np.zeros((frames, 2), dtype=np.float32)
+        finished = []
+
+        for midi_note, voice in list(self.voices.items()):
+            frequency = 440.0 * (
+                2.0 ** ((midi_note - 69) / 12.0)
+            )
+
+            # Slight oscillator detune creates a thicker sound.
+            frequency_a = frequency
+            frequency_b = frequency * (
+                2.0 ** (self.detune / 1200.0)
+            )
+
+            steps = np.arange(frames, dtype=np.float64)
+
+            phase_a = voice.phase + (
+                2.0 * math.pi * frequency_a / SAMPLE_RATE
+            ) * steps
+
+            phase_b = voice.phase + (
+                2.0 * math.pi * frequency_b / SAMPLE_RATE
+            ) * steps
+
+            wave_a = self.oscillator(
+                phase_a, voice.waveform
+            ).astype(np.float32)
+
+            wave_b = self.oscillator(
+                phase_b, voice.waveform
+            ).astype(np.float32)
+
+            # Blend two oscillators. Optional sub oscillator is one
+            # octave below the played note.
+            mono = 0.55 * wave_a + 0.45 * wave_b
+
+            if self.sub_level > 0.0:
+                phase_sub = voice.phase + (
+                    math.pi * frequency_a / SAMPLE_RATE
+                ) * steps
+                sub = np.sin(phase_sub).astype(np.float32)
+                mono += self.sub_level * sub
+
+            envelope = voice.render_envelope(
+                frames,
+                SAMPLE_RATE,
+                self.attack,
+                self.decay,
+                self.sustain,
+                self.release
+            )
+
+            mono *= envelope * voice.velocity * 0.25
+
+            # Small stereo spread, avoiding hard-panned notes.
+            result[:, 0] += mono * 0.92
+            result[:, 1] += mono
+
+            voice.phase = (
+                voice.phase
+                + 2.0 * math.pi * frequency_a
+                * frames / SAMPLE_RATE
+            ) % (2.0 * math.pi)
+
+            if voice.stage == "finished":
+                finished.append(midi_note)
+
+        for note in finished:
+            self.voices.pop(note, None)
+
+        return result
+
+    # --------------------------------------------------------
+    # CALLBACK
+    # --------------------------------------------------------
+
+    def render_sample_voices(self, frames):
+        """Render pitched WAV sample voices using linear interpolation."""
+        result = np.zeros((frames, 2), dtype=np.float32)
+        audio = self.sample_audio
+        if audio is None or not self.sample_voices:
+            return result
+
+        finished = []
+        for midi_note, voice in list(self.sample_voices.items()):
+            position = float(voice["position"])
+            ratio = float(voice["ratio"])
+            indices = position + np.arange(frames, dtype=np.float64) * ratio
+            valid = indices < len(audio)
+            if not np.any(valid):
+                finished.append(midi_note)
+                continue
+
+            count = int(np.count_nonzero(valid))
+            positions = indices[:count]
+            idx0 = positions.astype(np.int64)
+            idx1 = np.minimum(idx0 + 1, len(audio) - 1)
+            fraction = (positions - idx0).astype(np.float32)[:, None]
+            chunk = audio[idx0] * (1.0 - fraction) + audio[idx1] * fraction
+
+            release_remaining = int(voice["release_remaining"])
+            if release_remaining > 0:
+                total = max(1, int(voice["release_total"]))
+                fade = np.maximum(
+                    0.0,
+                    (release_remaining - np.arange(count, dtype=np.float32)) / total
+                )
+                chunk *= fade[:, None]
+                voice["release_remaining"] = max(0, release_remaining - count)
+                if voice["release_remaining"] <= 0:
+                    finished.append(midi_note)
+
+            chunk *= float(voice["velocity"]) * 0.35
+            result[:count] += chunk
+            voice["position"] = position + count * ratio
+            if voice["position"] >= len(audio):
+                finished.append(midi_note)
+
+        for note in set(finished):
+            self.sample_voices.pop(note, None)
+        return result
+
+    def callback(self, outdata, frames, time_info, status):
+        outdata.fill(0)
+
+        if status:
+            # Status information is intentionally not printed here:
+            # printing inside the audio callback can itself cause glitches.
+            pass
+
+        with self.lock:
+            mixed = np.zeros((frames, 2), dtype=np.float32)
+
+            # Synthesizer is independent of WAV playback.
+            synth = self.render_synth(frames)
+            samples = self.render_sample_voices(frames)
+            mixed += synth * self.synth_volume
+            mixed += samples * self.synth_volume
+
+            # WAV playback with a short fade-in to prevent initial clicks.
+            if self.wav_active and self.wav_audio is not None:
+                audio = self.wav_audio
+                available = len(audio) - int(self.wav_position)
+
+                if available <= 0:
+                    self.wav_active = False
+                    self.wav_audio = None
+                else:
+                    count = min(frames, available)
+                    positions = (
+                        self.wav_position
+                        + np.arange(count, dtype=np.float64)
+                    )
+
+                    idx0 = positions.astype(np.int64)
+                    idx1 = np.minimum(idx0 + 1, len(audio) - 1)
+                    fraction = (
+                        positions - idx0
+                    ).astype(np.float32)[:, None]
+
+                    wav = (
+                        audio[idx0] * (1.0 - fraction)
+                        + audio[idx1] * fraction
+                    )
+
+                    fade_length = max(
+                        1, int(SAMPLE_RATE * 0.010)
+                    )
+                    fade_positions = (
+                        self.wav_fade_in_position
+                        + np.arange(count, dtype=np.float32)
+                    )
+                    fade = np.minimum(
+                        fade_positions / fade_length, 1.0
+                    )
+                    wav *= fade[:, None]
+
+                    mixed[:count] += wav * self.wav_volume
+
+                    self.wav_position += count
+                    self.wav_fade_in_position += count
+
+                    if self.wav_position >= len(audio):
+                        self.wav_active = False
+                        self.wav_audio = None
+
+            # Low-pass filter on the combined synthesizer signal.
+            # The state persists between blocks, avoiding block clicks.
+            cutoff = float(
+                np.clip(self.cutoff, 40.0, SAMPLE_RATE * 0.45)
+            )
+            alpha = 1.0 - math.exp(
+                -2.0 * math.pi * cutoff / SAMPLE_RATE
+            )
+
+            filtered, self.filter_state = lfilter(
+                [alpha],
+                [1.0, -(1.0 - alpha)],
+                mixed,
+                axis=0,
+                zi=self.filter_state
+            )
+
+            # Simple delay.
+            if self.delay_mix > 0.001:
+                delay_frames = int(
+                    self.delay_seconds * SAMPLE_RATE
+                )
+                delay_frames = min(
+                    delay_frames, len(self.delay_buffer) - 1
+                )
+
+                indices = (
+                    self.delay_position
+                    + np.arange(frames)
+                ) % len(self.delay_buffer)
+
+                read_indices = (
+                    indices - delay_frames
+                ) % len(self.delay_buffer)
+
+                delayed = self.delay_buffer[read_indices].copy()
+
+                self.delay_buffer[indices] = (
+                    filtered + delayed * 0.25
+                )
+
+                filtered = (
+                    filtered * (1.0 - self.delay_mix * 0.25)
+                    + delayed * self.delay_mix
+                )
+
+                self.delay_position = (
+                    self.delay_position + frames
+                ) % len(self.delay_buffer)
+
+            # Short feedback reverb.
+            if self.reverb_mix > 0.001:
+                indices = (
+                    self.reverb_position
+                    + np.arange(frames)
+                ) % len(self.reverb_buffer)
+
+                delayed = self.reverb_buffer[indices].copy()
+
+                self.reverb_buffer[indices] = (
+                    filtered + delayed * 0.35
+                )
+
+                filtered = (
+                    filtered * (1.0 - self.reverb_mix * 0.25)
+                    + delayed * self.reverb_mix * 0.6
+                )
+
+                self.reverb_position = (
+                    self.reverb_position + frames
+                ) % len(self.reverb_buffer)
+
+            # Soft clipping limits peaks without abrupt hard clipping.
+            outdata[:] = np.tanh(
+                filtered * self.master_volume
+            )
+
+    def close(self):
+        try:
+            self.stop_wav()
+            self.release_all()
+            self.stream.stop()
+            self.stream.close()
+        except Exception as exc:
+            print("[Audio] Shutdown:", exc)
+
+
+# ============================================================
+# GUI
+# ============================================================
+
+class SoundboardApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
-        self.root.minsize(480, 760)
+        self.root.geometry("900x800")
+        self.root.minsize(760, 700)
         self.root.configure(bg="#111827")
 
         self.audio_cache = {}
-        self.buttons = {}
         self.hotkey_queue = queue.Queue()
         self.listener = None
-        self.device_index = find_output_device()
+
+        self.pressed_keys = set()
+        self.held_notes = {}
+        self.recording = False
+        self.record_start = 0.0
+        self.recorded_events = []
+        self.looping = False
+        self.loop_after_ids = []
+        self.loop_duration = 0.0
+        self.sample_path = None
+
+        self.octave = 4
+        self.device = find_output_device()
+
+        self.engine = None
+        self.audio_error = None
 
         try:
-            self.engine = LiveAudioEngine(self.device_index)
+            self.engine = AudioEngine(self.device)
         except Exception as exc:
-            self.engine = None
-            self._startup_error = str(exc)
-        else:
-            self._startup_error = None
+            self.audio_error = str(exc)
+            print("[Audio] Could not start output stream:", exc)
 
-        self._load_tracks()
-        self._build_gui()
-        self._start_hotkeys()
+        self.load_tracks()
+        self.build_gui()
+        self.start_hotkeys()
 
-        self.root.after(40, self._process_hotkeys)
+        self.root.bind_all(
+            "<KeyPress>", self.key_press, add="+"
+        )
+        self.root.bind_all(
+            "<KeyRelease>", self.key_release, add="+"
+        )
+        self.root.bind(
+            "<FocusOut>", self.release_all_keys, add="+"
+        )
+        self.root.bind_all(
+            "<space>", self.space_stop, add="+"
+        )
+
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-        if self._startup_error:
-            self.status_var.set(
-                "Audio unavailable: check device / sample rate"
-            )
-            print(
-                "Could not start audio output stream:",
-                self._startup_error
+        if self.audio_error:
+            self.status.set(
+                "Audio unavailable. Check output device and sample rate."
             )
         else:
-            self.status_var.set(
-                f"Ready | 48 kHz | output device {self.device_index}"
+            self.status.set(
+                f"Ready | {SAMPLE_RATE} Hz | "
+                f"{MAX_VOICES} synth voices"
             )
 
-    def _load_tracks(self):
-        for key, (label, filename) in TRACK_FILES.items():
+    # --------------------------------------------------------
+    # WAV SAMPLER / PERFORMANCE RECORDER
+    # --------------------------------------------------------
+
+    def choose_sample(self):
+        path = filedialog.askopenfilename(
+            title="Choose a WAV sample",
+            filetypes=[("WAV audio", "*.wav"), ("Audio files", "*.wav *.flac *.ogg *.aiff"), ("All files", "*.*")]
+        )
+        if path:
+            self.load_sampler_file(path)
+
+    def drop_sample(self, event):
+        try:
+            paths = self.root.tk.splitlist(event.data)
+            if paths:
+                self.load_sampler_file(paths[0])
+        except Exception as exc:
+            messagebox.showerror("Sampler", f"Could not read dropped file.\\n{exc}")
+
+    def load_sampler_file(self, path):
+        if not self.engine:
+            self.status.set("Audio engine is unavailable.")
+            return
+        try:
+            audio = load_wav(path)
+            if len(audio) < 2:
+                raise ValueError("The audio file is empty.")
+            self.engine.load_sample(audio, os.path.basename(path))
+            self.sample_path = path
+            self.sample_label.configure(text=f"Sampler: {os.path.basename(path)}")
+            self.status.set("Sampler mode: keyboard plays the loaded WAV at different pitches.")
+        except Exception as exc:
+            messagebox.showerror("Could not load sample", str(exc))
+
+    def switch_to_synth(self):
+        if self.engine:
+            self.engine.use_synth_mode()
+        self.sample_label.configure(text="Sampler off: built-in oscillator synthesizer")
+        self.status.set("Synth mode restored.")
+
+    def toggle_recording(self):
+        if not self.recording:
+            self.stop_loop()
+            self.recorded_events = []
+            self.record_start = time.monotonic()
+            self.recording = True
+            self.record_button.configure(text="■ STOP REC", bg="#7F1D1D")
+            self.status.set("Recording performance... play the keyboard.")
+        else:
+            self.recording = False
+            self.record_button.configure(text="● REC", bg="#B91C1C")
+            if self.recorded_events:
+                last_time = max(event[0] for event in self.recorded_events)
+                self.loop_duration = max(last_time + 0.25, 0.5)
+                self.status.set(f"Recording saved in memory: {len(self.recorded_events)} note events.")
+            else:
+                self.loop_duration = 0.0
+                self.status.set("Recording stopped: no notes captured.")
+
+    def record_note_event(self, kind, note):
+        if self.recording:
+            self.recorded_events.append((time.monotonic() - self.record_start, kind, int(note)))
+
+    def play_loop(self):
+        if not self.recorded_events:
+            self.status.set("Nothing recorded yet. Press REC, play notes, then stop recording.")
+            return
+        self.stop_loop()
+        self.looping = True
+        self.loop_duration = max(
+            self.loop_duration,
+            max(event[0] for event in self.recorded_events) + 0.25,
+            0.5
+        )
+        self._schedule_loop_pass(0.0)
+        self.status.set("Playing recorded performance in a loop.")
+
+    def _schedule_loop_pass(self, offset):
+        if not self.looping:
+            return
+        for event_time, kind, note in self.recorded_events:
+            delay_ms = max(0, int(event_time * 1000))
+            callback = lambda k=kind, n=note: self._play_recorded_event(k, n)
+            self.loop_after_ids.append(self.root.after(delay_ms, callback))
+        delay_ms = max(1, int(self.loop_duration * 1000))
+        self.loop_after_ids.append(
+            self.root.after(delay_ms, lambda: self._schedule_loop_pass(0.0))
+        )
+
+    def _play_recorded_event(self, kind, note):
+        if not self.looping or not self.engine:
+            return
+        if kind == "on":
+            self.engine.note_on(note)
+        else:
+            self.engine.note_off(note)
+
+    def stop_loop(self):
+        self.looping = False
+        for after_id in self.loop_after_ids:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self.loop_after_ids.clear()
+        if self.engine:
+            self.engine.release_all()
+
+
+    def load_tracks(self):
+        for key, (name, filename) in TRACKS.items():
             path = os.path.join(MUSIC_DIR, filename)
 
             if not os.path.isfile(path):
-                print(f"[Audio] Missing file: {path}")
+                print("[Audio] Missing:", path)
                 continue
 
             try:
                 self.audio_cache[key] = {
-                    "label": label,
-                    "data": load_audio(path),
-                    "path": path,
+                    "name": name,
+                    "audio": load_wav(path)
                 }
-                print(f"[Audio] Loaded: {path}")
-
+                print("[Audio] Loaded:", path)
             except Exception as exc:
-                print(f"[Audio] Could not load {path}: {exc}")
+                print("[Audio] Failed to load", path, exc)
 
-    def _build_gui(self):
-        self.canvas = tk.Canvas(
-            self.root, bg="#111827", highlightthickness=0
-        )
-        self.canvas.pack(fill="both", expand=True)
-
+    def build_gui(self):
+        # Optional background image.
         self.background_photo = None
 
         if os.path.isfile(BACKGROUND_FILE):
             try:
                 image = Image.open(BACKGROUND_FILE).convert("RGB")
                 image = image.resize(
-                    (WINDOW_WIDTH, WINDOW_HEIGHT),
-                    Image.Resampling.LANCZOS
+                    (900, 800), Image.Resampling.LANCZOS
                 )
                 self.background_photo = ImageTk.PhotoImage(image)
-                self.canvas.create_image(
-                    0, 0, image=self.background_photo, anchor="nw"
+                background = tk.Label(
+                    self.root, image=self.background_photo, bd=0
                 )
+                background.place(x=0, y=0, relwidth=1, relheight=1)
             except Exception as exc:
-                print(f"[GUI] Background image unavailable: {exc}")
+                print("[GUI] Background image:", exc)
 
-        frame = tk.Frame(self.canvas, bg="#111827", bd=0)
-        self.canvas.create_window(
-            0, 0, anchor="nw", window=frame,
-            width=WINDOW_WIDTH, height=WINDOW_HEIGHT
+        container = tk.Frame(
+            self.root, bg="#111827", bd=0
         )
+        container.pack(fill="both", expand=True, padx=14, pady=10)
 
         tk.Label(
-            frame,
+            container,
             text="JESUS 2026 SOUNDBOARD",
-            font=("Segoe UI", 16, "bold"),
+            font=("Segoe UI", 20, "bold"),
             fg="#F9FAFB",
             bg="#111827"
-        ).pack(pady=(12, 2))
+        ).pack(pady=(0, 2))
 
         tk.Label(
-            frame,
-            text="Press a button or use ALT + number",
-            font=("Segoe UI", 9),
-            fg="#CBD5E1",
+            container,
+            text="WAV SOUNDBOARD  +  POLY-8 SYNTHESIZER",
+            font=("Segoe UI", 10),
+            fg="#93C5FD",
             bg="#111827"
-        ).pack(pady=(0, 8))
+        ).pack(pady=(0, 10))
 
-        grid = tk.Frame(frame, bg="#111827")
-        grid.pack(fill="x", padx=10, pady=(0, 8))
+        # ----------------------------------------------------
+        # WAV SOUNDBOARD
+        # ----------------------------------------------------
 
-        for col in range(2):
-            grid.grid_columnconfigure(col, weight=1)
+        wav_frame = tk.LabelFrame(
+            container,
+            text="WAV SOUNDBOARD",
+            fg="white",
+            bg="#111827",
+            font=("Segoe UI", 10, "bold"),
+            padx=8,
+            pady=6
+        )
+        wav_frame.pack(fill="x", pady=(0, 10))
 
-        for index, key in enumerate(TRACK_FILES):
-            label, _ = TRACK_FILES[key]
+        for col in range(5):
+            wav_frame.grid_columnconfigure(col, weight=1)
+
+        self.wav_buttons = {}
+
+        for index, (key, (name, filename)) in enumerate(TRACKS.items()):
             loaded = key in self.audio_cache
-            shortcut = "ALT+0" if key == "0" else f"ALT+{key}"
-            button_text = f"{key}  {label}\n{shortcut}"
 
             button = tk.Button(
-                grid,
-                text=button_text,
+                wav_frame,
+                text=f"{key}  {name}\nALT+{key}",
                 command=lambda k=key: self.play_track(k),
                 font=("Segoe UI", 9, "bold"),
-                fg="#F9FAFB",
-                bg="#374151" if loaded else "#1F2937",
-                activebackground="#4B5563",
+                bg="#2563EB" if loaded else "#374151",
+                fg="white",
+                activebackground="#3B82F6",
                 activeforeground="white",
+                disabledforeground="#9CA3AF",
                 relief="flat",
-                bd=0,
-                padx=4,
-                pady=4,
+                padx=5,
+                pady=7,
                 state=(
                     "normal" if loaded and self.engine else "disabled"
-                ),
-                disabledforeground="#6B7280"
+                )
             )
 
             button.grid(
-                row=index // 2,
-                column=index % 2,
-                sticky="ew",
+                row=index // 5,
+                column=index % 5,
                 padx=3,
-                pady=2,
-                ipady=1
+                pady=3,
+                sticky="ew"
             )
-            self.buttons[key] = button
+            self.wav_buttons[key] = button
 
-        # Live effects panel.
-        effects = tk.LabelFrame(
-            frame,
-            text="LIVE EFFECTS",
-            font=("Segoe UI", 9, "bold"),
-            fg="#F9FAFB",
-            bg="#111827",
-            bd=1,
-            relief="groove",
-            labelanchor="n",
-            padx=8,
-            pady=3
+        wav_controls = tk.Frame(wav_frame, bg="#111827")
+        wav_controls.grid(
+            row=2, column=0, columnspan=5,
+            sticky="ew", pady=(5, 0)
         )
-        effects.pack(fill="x", padx=12, pady=(0, 6))
-
-        preset_row = tk.Frame(effects, bg="#111827")
-        preset_row.pack(fill="x", pady=(0, 2))
-
-        tk.Label(
-            preset_row,
-            text="Preset",
-            fg="#E5E7EB",
-            bg="#111827"
-        ).pack(side="left")
-
-        self.preset_var = tk.StringVar(value="No live effects")
-
-        preset_menu = ttk.Combobox(
-            preset_row,
-            textvariable=self.preset_var,
-            values=list(PRESETS.keys()),
-            state="readonly",
-            width=13
-        )
-        preset_menu.pack(side="right")
-        preset_menu.bind(
-            "<<ComboboxSelected>>", self._preset_changed
-        )
-
-        self.effect_vars = {
-            "pitch": tk.DoubleVar(
-                value=PRESETS["No live effects"]["pitch"]
-            ),
-            "echo": tk.DoubleVar(
-                value=PRESETS["No live effects"]["echo"]
-            ),
-            "reverb": tk.DoubleVar(
-                value=PRESETS["No live effects"]["reverb"]
-            ),
-            "chorus": tk.DoubleVar(
-                value=PRESETS["No live effects"]["chorus"]
-            ),
-        }
-
-        slider_specs = [
-            ("Pitch", "pitch", 0.5, 2.0, "{:.2f}x"),
-            ("Echo", "echo", 0.0, 0.8, "{:.2f}"),
-            ("Reverb", "reverb", 0.0, 0.85, "{:.2f}"),
-            ("Chorus", "chorus", 0.0, 0.8, "{:.2f}"),
-        ]
-
-        self.effect_value_labels = {}
-
-        for label, key, minimum, maximum, fmt in slider_specs:
-            row = tk.Frame(effects, bg="#111827")
-            row.pack(fill="x", pady=0)
-
-            tk.Label(
-                row,
-                text=label,
-                width=7,
-                anchor="w",
-                fg="#E5E7EB",
-                bg="#111827",
-                font=("Segoe UI", 8)
-            ).pack(side="left")
-
-            slider = tk.Scale(
-                row,
-                from_=minimum,
-                to=maximum,
-                resolution=0.01,
-                orient="horizontal",
-                showvalue=False,
-                variable=self.effect_vars[key],
-                command=lambda value, k=key: self._effect_changed(
-                    k, value
-                ),
-                bg="#111827",
-                fg="#E5E7EB",
-                troughcolor="#374151",
-                highlightthickness=0,
-                bd=0,
-                length=245,
-                sliderlength=14,
-                activebackground="#60A5FA"
-            )
-            slider.pack(side="left", fill="x", expand=True)
-
-            value_label = tk.Label(
-                row,
-                text=fmt.format(self.effect_vars[key].get()),
-                width=5,
-                fg="#93C5FD",
-                bg="#111827",
-                font=("Consolas", 8)
-            )
-            value_label.pack(side="right")
-            self.effect_value_labels[key] = (value_label, fmt)
-
-        controls = tk.Frame(frame, bg="#111827")
-        controls.pack(fill="x", padx=12, pady=(0, 4))
 
         tk.Button(
-            controls,
-            text="STOP",
-            command=self.stop_audio,
-            font=("Segoe UI", 9, "bold"),
-            fg="white",
+            wav_controls,
+            text="STOP WAV",
+            command=self.stop_wav,
             bg="#991B1B",
+            fg="white",
             activebackground="#B91C1C",
             relief="flat",
             padx=12,
-            pady=3
+            pady=4
         ).pack(side="left")
 
-        tk.Button(
-            controls,
-            text="Reset effects",
-            command=lambda: self.apply_preset("No live effects"),
-            font=("Segoe UI", 9),
-            fg="white",
-            bg="#374151",
-            activebackground="#4B5563",
-            relief="flat",
-            padx=8,
-            pady=3
-        ).pack(side="right")
-
-        # QWERTY sample synthesizer.
-        piano = tk.LabelFrame(
-            frame,
-            text="QWERTY SYNTH KEYBOARD",
-            font=("Segoe UI", 9, "bold"),
-            fg="#F9FAFB",
-            bg="#111827",
-            bd=1,
-            relief="groove",
-            labelanchor="n",
-            padx=8,
-            pady=5
-        )
-        piano.pack(fill="x", padx=12, pady=(0, 6))
-
-        octave_row = tk.Frame(piano, bg="#111827")
-        octave_row.pack(fill="x", pady=(0, 4))
+        self.wav_volume = tk.DoubleVar(value=WAV_VOLUME)
 
         tk.Label(
-            octave_row,
-            text="Octave",
-            fg="#E5E7EB",
-            bg="#111827"
+            wav_controls,
+            text="WAV volume",
+            bg="#111827",
+            fg="white"
+        ).pack(side="left", padx=(14, 5))
+
+        tk.Scale(
+            wav_controls,
+            from_=0.0,
+            to=1.0,
+            resolution=0.01,
+            orient="horizontal",
+            variable=self.wav_volume,
+            command=self.change_wav_volume,
+            showvalue=True,
+            length=160,
+            bg="#111827",
+            fg="white",
+            troughcolor="#374151",
+            highlightthickness=0
         ).pack(side="left")
 
-        self.octave_var = tk.IntVar(value=4)
+        # ----------------------------------------------------
+        # SYNTHESIZER
+        # ----------------------------------------------------
+
+        synth_frame = tk.LabelFrame(
+            container,
+            text="POLY-8 SYNTHESIZER",
+            fg="white",
+            bg="#111827",
+            font=("Segoe UI", 10, "bold"),
+            padx=10,
+            pady=8
+        )
+        synth_frame.pack(fill="both", expand=True, pady=(0, 8))
+
+        # Top controls
+        top = tk.Frame(synth_frame, bg="#111827")
+        top.pack(fill="x", pady=(0, 8))
+
+        tk.Label(
+            top,
+            text="Waveform",
+            bg="#111827",
+            fg="white"
+        ).pack(side="left")
+
+        self.waveform_var = tk.StringVar(value="Saw")
+
+        waveform_menu = ttk.Combobox(
+            top,
+            textvariable=self.waveform_var,
+            values=["Sine", "Saw", "Square", "Triangle"],
+            state="readonly",
+            width=11
+        )
+        waveform_menu.pack(side="left", padx=6)
+        waveform_menu.bind(
+            "<<ComboboxSelected>>", self.change_waveform
+        )
+
+        tk.Label(
+            top,
+            text="Octave",
+            bg="#111827",
+            fg="white"
+        ).pack(side="left", padx=(15, 4))
 
         tk.Button(
-            octave_row,
-            text="−",
-            width=3,
-            command=lambda: self.change_octave(-1),
-            fg="white",
-            bg="#374151",
-            relief="flat"
-        ).pack(side="right", padx=(3, 0))
-
-        tk.Button(
-            octave_row,
-            text="+",
-            width=3,
-            command=lambda: self.change_octave(1),
-            fg="white",
-            bg="#374151",
-            relief="flat"
-        ).pack(side="right", padx=(3, 0))
+            top, text="−", width=3,
+            command=lambda: self.change_octave(-1)
+        ).pack(side="left")
 
         self.octave_label = tk.Label(
-            octave_row,
-            text="4",
-            width=3,
-            fg="#93C5FD",
+            top,
+            text=str(self.octave),
             bg="#111827",
-            font=("Segoe UI", 10, "bold")
+            fg="#93C5FD",
+            width=3,
+            font=("Segoe UI", 11, "bold")
         )
-        self.octave_label.pack(side="right")
+        self.octave_label.pack(side="left")
+
+        tk.Button(
+            top, text="+", width=3,
+            command=lambda: self.change_octave(1)
+        ).pack(side="left")
+
+        tk.Button(
+            top,
+            text="RELEASE ALL",
+            command=self.release_all_keys,
+            bg="#374151",
+            fg="white",
+            relief="flat"
+        ).pack(side="right")
+
+        # WAV sampler and performance recorder
+        sampler = tk.Frame(synth_frame, bg="#111827")
+        sampler.pack(fill="x", pady=(0, 8))
+
+        self.sample_label = tk.Label(
+            sampler, text="Sampler: no WAV loaded",
+            bg="#111827", fg="#FBBF24", anchor="w"
+        )
+        self.sample_label.pack(side="left", fill="x", expand=True)
+
+        tk.Button(
+            sampler, text="LOAD / DROP WAV",
+            command=self.choose_sample, bg="#7C3AED", fg="white",
+            relief="flat", padx=8, pady=4
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            sampler, text="SYNTH MODE",
+            command=self.switch_to_synth, bg="#374151", fg="white",
+            relief="flat", padx=8, pady=4
+        ).pack(side="left", padx=3)
+
+        self.record_button = tk.Button(
+            sampler, text="● REC", command=self.toggle_recording,
+            bg="#B91C1C", fg="white", relief="flat", padx=8, pady=4
+        )
+        self.record_button.pack(side="left", padx=3)
+
+        tk.Button(
+            sampler, text="PLAY LOOP", command=self.play_loop,
+            bg="#047857", fg="white", relief="flat", padx=8, pady=4
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            sampler, text="STOP LOOP", command=self.stop_loop,
+            bg="#92400E", fg="white", relief="flat", padx=8, pady=4
+        ).pack(side="left", padx=3)
+
+        self.drop_target = tk.Label(
+            synth_frame,
+            text=("Drag a WAV file here to map it across every key" if DND_AVAILABLE
+                  else "Drag-and-drop requires tkinterdnd2; LOAD / DROP WAV still works"),
+            bg="#1F2937", fg="#D1D5DB", relief="groove", pady=5
+        )
+        self.drop_target.pack(fill="x", pady=(0, 8))
+        if DND_AVAILABLE:
+            try:
+                self.drop_target.drop_target_register(DND_FILES)
+                self.drop_target.dnd_bind("<<Drop>>", self.drop_sample)
+            except Exception as exc:
+                print("[GUI] Drag-and-drop setup failed:", exc)
+
+        # Keyboard display
+        keyboard_frame = tk.Frame(synth_frame, bg="#111827")
+        keyboard_frame.pack(fill="x", pady=(2, 12))
 
         tk.Label(
-            octave_row,
-            text="Shortcuts: [ / ]",
-            fg="#9CA3AF",
+            keyboard_frame,
+            text="Play with your computer keyboard or click the keys",
             bg="#111827",
-            font=("Segoe UI", 8)
-        ).pack(side="left", padx=(12, 0))
+            fg="#D1D5DB",
+            font=("Segoe UI", 9)
+        ).pack(pady=(0, 6))
 
-        # Chromatic keyboard mapping.
-        self.piano_key_map = {
-            "a": 0, "w": 1, "s": 2, "e": 3, "d": 4,
-            "f": 5, "t": 6, "g": 7, "y": 8, "h": 9,
-            "u": 10, "j": 11, "k": 12, "o": 13, "l": 14,
-        }
+        piano_row = tk.Frame(keyboard_frame, bg="#111827")
+        piano_row.pack(fill="x")
 
-        self.pressed_piano_keys = set()
-        self.held_piano_notes = {}
         self.piano_buttons = {}
 
-        piano_keys_row = tk.Frame(piano, bg="#111827")
-        piano_keys_row.pack(fill="x")
+        black_notes = {1, 3, 6, 8, 10, 13}
+        key_names = list(KEY_SEMITONES.keys())
 
-        black_semitones = {1, 3, 6, 8, 10, 13}
-        key_labels = [
-            "A", "W", "S", "E", "D", "F", "T", "G",
-            "Y", "H", "U", "J", "K", "O", "L"
-        ]
+        for key_name, semitone in KEY_SEMITONES.items():
+            black = semitone in black_notes
 
-        for offset, key_name in enumerate(key_labels):
-            is_black = offset in black_semitones
-
-            key_button = tk.Button(
-                piano_keys_row,
-                text=key_name,
-                font=("Segoe UI", 8, "bold"),
-                fg="white" if is_black else "#111827",
-                bg="#111827" if is_black else "#F3F4F6",
+            button = tk.Button(
+                piano_row,
+                text=key_name.upper(),
+                font=("Segoe UI", 9, "bold"),
+                bg="#111827" if black else "#F3F4F6",
+                fg="white" if black else "#111827",
                 activebackground="#60A5FA",
                 relief="raised",
                 bd=1,
                 padx=0,
-                pady=9,
+                pady=16,
                 takefocus=False
             )
-
-            key_button.pack(
+            button.pack(
                 side="left", fill="x", expand=True, padx=1
             )
 
-            key_button.bind(
+            button.bind(
                 "<ButtonPress-1>",
-                lambda event, k=key_name.lower(): self._piano_press(k)
+                lambda event, k=key_name: self.note_press(k)
             )
-            key_button.bind(
+            button.bind(
                 "<ButtonRelease-1>",
-                lambda event, k=key_name.lower(): self._piano_release(k)
+                lambda event, k=key_name: self.note_release(k)
             )
 
-            self.piano_buttons[key_name.lower()] = key_button
+            self.piano_buttons[key_name] = button
 
         tk.Label(
-            piano,
-            text="A W S E D F T G Y H U J K O L | Hold keys for notes",
-            fg="#9CA3AF",
+            keyboard_frame,
+            text="A W S E D F T G Y H U J K O L     |     [ / ] octave",
             bg="#111827",
-            font=("Segoe UI", 8)
-        ).pack(pady=(4, 0))
+            fg="#9CA3AF",
+            font=("Consolas", 9)
+        ).pack(pady=(5, 0))
 
-        self.root.bind_all(
-            "<KeyPress>", self._handle_piano_keypress, add="+"
+        # Synth controls
+        controls = tk.Frame(synth_frame, bg="#111827")
+        controls.pack(fill="x")
+
+        controls.grid_columnconfigure(0, weight=1)
+        controls.grid_columnconfigure(1, weight=1)
+
+        self.adsr_vars = {
+            "attack": tk.DoubleVar(value=0.010),
+            "decay": tk.DoubleVar(value=0.12),
+            "sustain": tk.DoubleVar(value=0.70),
+            "release": tk.DoubleVar(value=0.080),
+        }
+
+        self.add_slider(
+            controls, "Attack", "attack",
+            0.001, 1.0, 0, 0,
+            self.change_adsr
         )
-        self.root.bind_all(
-            "<KeyRelease>", self._handle_piano_keyrelease, add="+"
+        self.add_slider(
+            controls, "Decay", "decay",
+            0.001, 1.0, 0, 1,
+            self.change_adsr
         )
-        self.root.bind(
-            "<FocusOut>", self._release_all_piano_keys, add="+"
+        self.add_slider(
+            controls, "Sustain", "sustain",
+            0.0, 1.0, 1, 0,
+            self.change_adsr
+        )
+        self.add_slider(
+            controls, "Release", "release",
+            0.005, 2.0, 1, 1,
+            self.change_adsr
         )
 
-        self.status_var = tk.StringVar(value="Starting audio...")
+        self.cutoff_var = tk.DoubleVar(value=12000)
+        self.add_slider(
+            controls, "Filter cutoff", "cutoff",
+            200, 18000, 2, 0,
+            self.change_filter
+        )
+
+        self.detune_var = tk.DoubleVar(value=5.0)
+        self.add_slider(
+            controls, "Detune (cents)", "detune",
+            0, 30, 2, 1,
+            self.change_detune
+        )
+
+        self.sub_var = tk.DoubleVar(value=0.0)
+        self.add_slider(
+            controls, "Sub oscillator", "sub",
+            0, 0.8, 3, 0,
+            self.change_sub
+        )
+
+        self.synth_volume = tk.DoubleVar(value=SYNTH_VOLUME)
+        self.add_slider(
+            controls, "Synth volume", "synth_volume",
+            0, 0.8, 3, 1,
+            self.change_synth_volume
+        )
+
+        # Effects
+        effects = tk.Frame(synth_frame, bg="#111827")
+        effects.pack(fill="x", pady=(8, 0))
+
+        self.delay_var = tk.DoubleVar(value=0.0)
+        self.reverb_var = tk.DoubleVar(value=0.0)
 
         tk.Label(
-            frame,
-            textvariable=self.status_var,
-            font=("Segoe UI", 8),
+            effects,
+            text="Delay",
+            fg="white",
+            bg="#111827"
+        ).pack(side="left")
+
+        tk.Scale(
+            effects,
+            from_=0.0, to=0.7,
+            resolution=0.01,
+            orient="horizontal",
+            variable=self.delay_var,
+            command=self.change_delay,
+            showvalue=True,
+            length=150,
+            bg="#111827",
+            fg="white",
+            troughcolor="#374151",
+            highlightthickness=0
+        ).pack(side="left", padx=(2, 12))
+
+        tk.Label(
+            effects,
+            text="Reverb",
+            fg="white",
+            bg="#111827"
+        ).pack(side="left")
+
+        tk.Scale(
+            effects,
+            from_=0.0, to=0.7,
+            resolution=0.01,
+            orient="horizontal",
+            variable=self.reverb_var,
+            command=self.change_reverb,
+            showvalue=True,
+            length=150,
+            bg="#111827",
+            fg="white",
+            troughcolor="#374151",
+            highlightthickness=0
+        ).pack(side="left", padx=2)
+
+        # Master
+        master = tk.Frame(container, bg="#111827")
+        master.pack(fill="x", pady=(0, 4))
+
+        self.master_var = tk.DoubleVar(value=MASTER_VOLUME)
+
+        tk.Label(
+            master,
+            text="MASTER",
+            fg="white",
+            bg="#111827",
+            font=("Segoe UI", 9, "bold")
+        ).pack(side="left")
+
+        tk.Scale(
+            master,
+            from_=0.0, to=1.0,
+            resolution=0.01,
+            orient="horizontal",
+            variable=self.master_var,
+            command=self.change_master,
+            showvalue=True,
+            length=200,
+            bg="#111827",
+            fg="white",
+            troughcolor="#374151",
+            highlightthickness=0
+        ).pack(side="left", padx=8)
+
+        self.status = tk.StringVar(value="Starting...")
+        tk.Label(
+            container,
+            textvariable=self.status,
             fg="#D1D5DB",
             bg="#111827",
-            wraplength=420
-        ).pack(fill="x", padx=12, pady=(0, 6))
+            anchor="w",
+            wraplength=850
+        ).pack(fill="x", pady=(3, 0))
 
-    # -----------------------------------------------------------------------
-    # Synth keyboard
-    # -----------------------------------------------------------------------
+    # --------------------------------------------------------
+    # SLIDER HELPER
+    # --------------------------------------------------------
 
-    def change_octave(self, amount):
-        new_octave = max(
-            1, min(7, self.octave_var.get() + amount)
-        )
-        self.octave_var.set(new_octave)
-        self.octave_label.configure(text=str(new_octave))
-        self.status_var.set(f"Synth octave: {new_octave}")
-
-    def _midi_for_piano_key(self, key_name):
-        # C4 is MIDI 60; each octave shifts notes by 12 semitones.
-        return (
-            12 * (self.octave_var.get() + 1)
-            + self.piano_key_map[key_name]
+    def add_slider(self, parent, label, key, minimum, maximum,
+                   row, column, callback):
+        box = tk.Frame(parent, bg="#111827")
+        box.grid(
+            row=row, column=column,
+            padx=6, pady=3, sticky="ew"
         )
 
-    def _piano_press(self, key_name):
-        if key_name not in self.piano_key_map or not self.engine:
-            return
+        tk.Label(
+            box,
+            text=label,
+            bg="#111827",
+            fg="#E5E7EB",
+            anchor="w"
+        ).pack(fill="x")
 
-        if key_name in self.pressed_piano_keys:
-            return
+        if key in self.adsr_vars:
+            variable = self.adsr_vars[key]
+        elif key == "cutoff":
+            variable = self.cutoff_var
+        elif key == "detune":
+            variable = self.detune_var
+        elif key == "sub":
+            variable = self.sub_var
+        else:
+            variable = self.synth_volume
 
-        self.pressed_piano_keys.add(key_name)
-        midi_note = self._midi_for_piano_key(key_name)
-        self.held_piano_notes[key_name] = midi_note
+        tk.Scale(
+            box,
+            from_=minimum,
+            to=maximum,
+            resolution=0.001 if maximum <= 2 else 1,
+            orient="horizontal",
+            variable=variable,
+            command=lambda value, k=key: callback(k, value),
+            showvalue=True,
+            bg="#111827",
+            fg="white",
+            troughcolor="#374151",
+            highlightthickness=0
+        ).pack(fill="x")
 
-        self.engine.note_on(midi_note)
-
-        button = self.piano_buttons.get(key_name)
-        if button:
-            button.configure(relief="sunken")
-
-    def _piano_release(self, key_name):
-        if key_name not in self.piano_key_map:
-            return
-
-        self.pressed_piano_keys.discard(key_name)
-        midi_note = self.held_piano_notes.pop(key_name, None)
-
-        if self.engine and midi_note is not None:
-            self.engine.note_off(midi_note)
-
-        button = self.piano_buttons.get(key_name)
-        if button:
-            button.configure(relief="raised")
-
-    def _handle_piano_keypress(self, event):
-        key_name = event.keysym.lower()
-
-        if key_name in ("bracketleft", "bracketright"):
-            if key_name == "bracketleft":
-                self.change_octave(-1)
-            else:
-                self.change_octave(1)
-            return
-
-        if key_name in self.piano_key_map:
-            self._piano_press(key_name)
-
-    def _handle_piano_keyrelease(self, event):
-        key_name = event.keysym.lower()
-
-        if key_name in self.piano_key_map:
-            self._piano_release(key_name)
-
-    def _release_all_piano_keys(self, _event=None):
-        for key_name in list(self.held_piano_notes):
-            self._piano_release(key_name)
-
-    # -----------------------------------------------------------------------
-    # Effects
-    # -----------------------------------------------------------------------
-
-    def _effect_changed(self, key, value):
-        numeric = float(value)
-        label, fmt = self.effect_value_labels[key]
-        label.configure(text=fmt.format(numeric))
-
-        if self.engine:
-            self.engine.set_params(**{key: numeric})
-
-        if hasattr(self, "preset_var"):
-            self.preset_var.set("Custom")
-
-    def _preset_changed(self, _event=None):
-        self.apply_preset(self.preset_var.get())
-
-    def apply_preset(self, name):
-        if name not in PRESETS:
-            name = "No live effects"
-
-        preset = PRESETS[name]
-        self.preset_var.set(name)
-
-        for key, value in preset.items():
-            self.effect_vars[key].set(value)
-            label, fmt = self.effect_value_labels[key]
-            label.configure(text=fmt.format(value))
-
-        if self.engine:
-            self.engine.apply_preset(name)
-
-    # -----------------------------------------------------------------------
-    # Playback
-    # -----------------------------------------------------------------------
+    # --------------------------------------------------------
+    # WAV CONTROLS
+    # --------------------------------------------------------
 
     def play_track(self, key):
         if not self.engine:
-            self.status_var.set(
-                "Audio engine unavailable. Check the output device."
-            )
             return
 
         track = self.audio_cache.get(key)
-
         if not track:
-            self.status_var.set(f"Missing audio file for sound {key}.")
+            self.status.set(f"Missing WAV file for sound {key}.")
             return
 
-        self.engine.play(track["data"])
-        self.status_var.set(
-            f"Playing: {track['label']} | live effects: "
-            f"{self.preset_var.get()}"
-        )
+        self.engine.play_wav(track["audio"])
+        self.status.set(f"WAV playing: {track['name']}")
 
-    def stop_audio(self):
+    def stop_wav(self):
         if self.engine:
-            self.engine.stop()
+            self.engine.stop_wav()
+        self.status.set("WAV stopped. Synthesizer remains available.")
 
-        self.status_var.set(
-            "Stopped. The last WAV remains loaded in the synthesizer."
-        )
+    def change_wav_volume(self, value):
+        if self.engine:
+            self.engine.wav_volume = float(value)
 
-    # -----------------------------------------------------------------------
-    # Global hotkeys
-    # -----------------------------------------------------------------------
+    # --------------------------------------------------------
+    # SYNTH CONTROLS
+    # --------------------------------------------------------
 
-    def _start_hotkeys(self):
-        hotkeys = {
-            f"<alt>+{key}": (
+    def change_waveform(self, _event=None):
+        if self.engine:
+            self.engine.set_waveform(self.waveform_var.get())
+        self.status.set(f"Waveform: {self.waveform_var.get()}")
+
+    def change_octave(self, amount):
+        self.octave = max(1, min(7, self.octave + amount))
+        self.octave_label.configure(text=str(self.octave))
+        self.status.set(f"Synth octave: {self.octave}")
+
+    def midi_note(self, key):
+        # MIDI note 60 = C4.
+        return 12 * (self.octave + 1) + KEY_SEMITONES[key]
+
+    def note_press(self, key):
+        if not self.engine or key not in KEY_SEMITONES:
+            return
+
+        if key in self.pressed_keys:
+            return
+
+        self.pressed_keys.add(key)
+        note = self.midi_note(key)
+        self.held_notes[key] = note
+        self.engine.note_on(note)
+        self.record_note_event("on", note)
+
+        button = self.piano_buttons.get(key)
+        if button:
+            button.configure(relief="sunken")
+
+    def note_release(self, key):
+        self.pressed_keys.discard(key)
+        note = self.held_notes.pop(key, None)
+
+        if self.engine and note is not None:
+            self.engine.note_off(note)
+            self.record_note_event("off", note)
+
+        button = self.piano_buttons.get(key)
+        if button:
+            button.configure(relief="raised")
+
+    def key_press(self, event):
+        key = event.keysym.lower()
+
+        if key == "bracketleft":
+            self.change_octave(-1)
+            return
+
+        if key == "bracketright":
+            self.change_octave(1)
+            return
+
+        if key in KEY_SEMITONES:
+            self.note_press(key)
+
+    def key_release(self, event):
+        key = event.keysym.lower()
+
+        if key in KEY_SEMITONES:
+            self.note_release(key)
+
+    def release_all_keys(self, _event=None):
+        for key in list(self.held_notes):
+            self.note_release(key)
+
+        if self.engine:
+            self.engine.release_all()
+
+    def space_stop(self, _event=None):
+        self.stop_wav()
+        return "break"
+
+    def change_adsr(self, key, value):
+        if not self.engine:
+            return
+
+        self.engine.set_envelope(**{key: float(value)})
+
+    def change_filter(self, _key, value):
+        if self.engine:
+            self.engine.set_filter(cutoff=float(value))
+
+    def change_detune(self, _key, value):
+        if self.engine:
+            self.engine.set_detune(float(value))
+
+    def change_sub(self, _key, value):
+        if self.engine:
+            self.engine.set_sub_level(float(value))
+
+    def change_synth_volume(self, _key, value):
+        if self.engine:
+            self.engine.synth_volume = float(value)
+
+    def change_delay(self, value):
+        if self.engine:
+            self.engine.set_effects(delay=float(value))
+
+    def change_reverb(self, value):
+        if self.engine:
+            self.engine.set_effects(reverb=float(value))
+
+    def change_master(self, value):
+        if self.engine:
+            self.engine.master_volume = float(value)
+
+    # --------------------------------------------------------
+    # GLOBAL HOTKEYS
+    # --------------------------------------------------------
+
+    def start_hotkeys(self):
+        hotkeys = {}
+
+        for key in TRACKS:
+            hotkeys[f"<alt>+{key}"] = (
                 lambda k=key: self.hotkey_queue.put(k)
             )
-            for key in TRACK_FILES
-        }
 
-        self.listener = keyboard.GlobalHotKeys(hotkeys)
-        self.listener.start()
+        try:
+            self.listener = keyboard.GlobalHotKeys(hotkeys)
+            self.listener.start()
+        except Exception as exc:
+            print("[Keyboard] Global hotkeys unavailable:", exc)
 
-    def _process_hotkeys(self):
+    def process_hotkeys(self):
         try:
             while True:
                 key = self.hotkey_queue.get_nowait()
@@ -1050,13 +1655,15 @@ class JesusAlarmSoundboard:
             pass
 
         if self.root.winfo_exists():
-            self.root.after(40, self._process_hotkeys)
+            self.root.after(40, self.process_hotkeys)
 
-    # -----------------------------------------------------------------------
-    # Shutdown
-    # -----------------------------------------------------------------------
+    # --------------------------------------------------------
+    # SHUTDOWN
+    # --------------------------------------------------------
 
     def close(self):
+        self.stop_loop()
+        self.recording = False
         try:
             if self.listener:
                 self.listener.stop()
@@ -1066,14 +1673,13 @@ class JesusAlarmSoundboard:
         if self.engine:
             self.engine.close()
 
-        self.pressed_piano_keys.clear()
-        self.held_piano_notes.clear()
         self.root.destroy()
 
 
 def main():
-    root = tk.Tk()
-    JesusAlarmSoundboard(root)
+    root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
+    app = SoundboardApp(root)
+    root.after(40, app.process_hotkeys)
     root.mainloop()
 
 
